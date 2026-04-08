@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from sklearn.feature_extraction.text import HashingVectorizer
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -30,6 +29,7 @@ from ui_scene.engine.training import (
     build_weighted_sampler,
 )
 from ui_scene.models.multimodal_model import MultimodalSceneClassifier
+from ui_scene.preprocess.tree_vectorizer import TreeTextVectorizer
 from ui_scene.utils.config import load_config
 from ui_scene.utils.seed import set_seed
 
@@ -85,19 +85,15 @@ def build_transforms(image_size: int, augmentation: str = 'legacy') -> tuple[tra
     return train_transform, eval_transform
 
 
-def build_collate_fn(tree_input_dim: int):
-    vectorizer = HashingVectorizer(
-        n_features=tree_input_dim,
-        alternate_sign=False,
-        norm='l2',
-    )
-
+def build_collate_fn(tree_vectorizer: TreeTextVectorizer):
     def collate_fn(batch: list[dict]) -> dict:
         images = torch.stack([item['image'] for item in batch], dim=0)
         labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
         tree_texts = [item['tree_text'] for item in batch]
-        tree_features = vectorizer.transform(tree_texts).toarray()
-        tree_features = torch.tensor(tree_features, dtype=torch.float32)
+        if batch and batch[0].get('tree_features') is not None:
+            tree_features = torch.stack([item['tree_features'] for item in batch], dim=0)
+        else:
+            tree_features = torch.tensor(tree_vectorizer.transform(tree_texts), dtype=torch.float32)
         return {
             'sample_id': [item['sample_id'] for item in batch],
             'image': images,
@@ -177,6 +173,11 @@ def evaluate(
     }
 
 
+def set_backbone_trainable(model: MultimodalSceneClassifier, enabled: bool) -> None:
+    for parameter in model.image_backbone.parameters():
+        parameter.requires_grad = enabled
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -191,7 +192,6 @@ def main() -> None:
     batch_size = args.batch_size if args.batch_size is not None else int(train_cfg['batch_size'])
     image_size = int(train_cfg['image_size'])
     num_workers = int(train_cfg.get('num_workers', 0))
-    tree_input_dim = int(train_cfg.get('tree_input_dim', 512))
     max_tree_tokens = int(train_cfg.get('max_tree_tokens', 256))
     tree_profile = str(train_cfg.get('tree_profile', 'legacy'))
     learning_rate = float(train_cfg['learning_rate'])
@@ -202,6 +202,13 @@ def main() -> None:
     optimizer_cfg = train_cfg.get('optimizer', {})
     scheduler_cfg = train_cfg.get('scheduler', {})
     optimizer_name = str(optimizer_cfg.get('name', 'adam')) if isinstance(optimizer_cfg, dict) else str(optimizer_cfg)
+    freeze_backbone_epochs = int(train_cfg.get('freeze_backbone_epochs', 0))
+    precompute_tree_features = bool(train_cfg.get('precompute_tree_features', False))
+    tree_cache_workers = int(train_cfg.get('tree_cache_workers', 0))
+    tree_feature_chunk_size = int(train_cfg.get('tree_feature_chunk_size', 2048))
+    aux_cfg = train_cfg.get('auxiliary_loss', {}) or {}
+    image_aux_weight = float(aux_cfg.get('image_weight', 0.0))
+    tree_aux_weight = float(aux_cfg.get('tree_weight', 0.0))
 
     manifest_root = Path(path_cfg['manifest_root'])
     output_root = Path(path_cfg['output_root'])
@@ -225,6 +232,7 @@ def main() -> None:
         image_transform=train_transform,
         max_tree_nodes=max_tree_tokens,
         tree_profile=tree_profile,
+        tree_cache_workers=tree_cache_workers,
     )
     val_dataset = MultimodalClassificationDataset(
         val_records,
@@ -232,6 +240,7 @@ def main() -> None:
         image_transform=eval_transform,
         max_tree_nodes=max_tree_tokens,
         tree_profile=tree_profile,
+        tree_cache_workers=tree_cache_workers,
     )
     use_cuda = torch.cuda.is_available()
     if use_cuda:
@@ -241,8 +250,29 @@ def main() -> None:
     if sampler_name == 'weighted_random':
         train_sampler = build_weighted_sampler(train_records, label_to_index)
 
-    collate_fn = build_collate_fn(tree_input_dim)
-    loader_kwargs = build_loader_kwargs(num_workers=num_workers, use_cuda=use_cuda, collate_fn=collate_fn)
+    tree_vectorizer = TreeTextVectorizer.from_config(train_cfg)
+    if precompute_tree_features:
+        print('Precomputing train tree features...')
+        train_dataset.set_tree_feature_matrix(
+            tree_vectorizer.transform_parallel(
+                train_dataset.tree_texts,
+                num_workers=tree_cache_workers,
+                chunk_size=tree_feature_chunk_size,
+            )
+        )
+        print('Precomputing val tree features...')
+        val_dataset.set_tree_feature_matrix(
+            tree_vectorizer.transform_parallel(
+                val_dataset.tree_texts,
+                num_workers=tree_cache_workers,
+                chunk_size=tree_feature_chunk_size,
+            )
+        )
+    loader_kwargs = build_loader_kwargs(
+        num_workers=num_workers,
+        use_cuda=use_cuda,
+        collate_fn=build_collate_fn(tree_vectorizer),
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -261,13 +291,15 @@ def main() -> None:
     model = MultimodalSceneClassifier(
         backbone_name=model_cfg['image_backbone'],
         image_dim=int(model_cfg.get('image_dim', model_cfg.get('fusion_dim', 256))),
-        tree_input_dim=tree_input_dim,
+        tree_input_dim=tree_vectorizer.output_dim,
         tree_dim=int(model_cfg.get('tree_hidden_dim', 128)),
         fusion_dim=int(model_cfg.get('fusion_dim', 256)),
         num_classes=len(label_to_index),
         fusion_mode=str(model_cfg.get('fusion_mode', 'concat')),
         tree_encoder_type=str(model_cfg.get('tree_encoder_type', 'simple')),
         dropout=float(model_cfg.get('dropout', 0.1)),
+        use_aux_heads=bool(model_cfg.get('use_aux_heads', False)),
+        branch_dropout=float(model_cfg.get('branch_dropout', 0.0)),
     ).to(device)
 
     resume_from = args.resume_from if args.resume_from is not None else train_cfg.get('resume_from')
@@ -305,8 +337,20 @@ def main() -> None:
     print(f'Optimizer: {optimizer_name}')
     print(f'Sampler: {sampler_name}')
     print(f'Tree profile: {tree_profile}')
+    print(f'Tree vectorizer: {tree_vectorizer.strategy} ({tree_vectorizer.output_dim} dims)')
+    print(f'Precompute tree features: {precompute_tree_features}')
+    print(f'Tree cache workers: {tree_cache_workers}')
     print(f"Fusion mode: {model_cfg.get('fusion_mode', 'concat')}")
+    print(f'Freeze backbone epochs: {freeze_backbone_epochs}')
+    if image_aux_weight > 0.0 or tree_aux_weight > 0.0:
+        print(f'Auxiliary loss weights: image={image_aux_weight} tree={tree_aux_weight}')
     non_blocking = device.type == 'cuda'
+
+    backbone_frozen = False
+    if freeze_backbone_epochs > 0 and hasattr(model, 'image_backbone'):
+        set_backbone_trainable(model, False)
+        backbone_frozen = True
+        print('Image backbone frozen for warmup epochs.')
 
     if resume_from:
         initial_metrics = evaluate(
@@ -337,7 +381,14 @@ def main() -> None:
             f"val_macro_f1={initial_metrics['macro_f1']:.4f}"
         )
 
+    use_aux_losses = bool(model_cfg.get('use_aux_heads', False)) and (image_aux_weight > 0.0 or tree_aux_weight > 0.0)
+
     for epoch in range(1, epochs + 1):
+        if backbone_frozen and epoch == freeze_backbone_epochs + 1:
+            set_backbone_trainable(model, True)
+            backbone_frozen = False
+            print('Image backbone unfrozen.')
+
         model.train()
         predictions: list[int] = []
         labels: list[int] = []
@@ -350,8 +401,17 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                logits, _ = model(images, tree_features)
+                if use_aux_losses:
+                    logits, _, aux_outputs = model(images, tree_features, return_aux=True)
+                else:
+                    logits, _ = model(images, tree_features)
+                    aux_outputs = {}
+
                 loss = criterion(logits, target)
+                if image_aux_weight > 0.0 and 'image_logits' in aux_outputs:
+                    loss = loss + image_aux_weight * criterion(aux_outputs['image_logits'], target)
+                if tree_aux_weight > 0.0 and 'tree_logits' in aux_outputs:
+                    loss = loss + tree_aux_weight * criterion(aux_outputs['tree_logits'], target)
 
             if amp_enabled:
                 scaler.scale(loss).backward()

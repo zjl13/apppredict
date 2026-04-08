@@ -104,25 +104,76 @@
 - Clustering: `NMI 0.4428 / ARI 0.3373 / Silhouette 0.1872`
 
 结论
-- 这是目前最有效的一轮优化，也是当前最佳结果。
+- 这轮首次显著拉开了多模态和图像基线的差距。
 - 真正拉开差距的不是继续调 optimizer，而是增强树语义特征和 fusion 结构。
-- 当前最佳路线：`semantic_v2 + tree_input_dim=2048 + deep tree encoder + gated fusion`。
+- 当时的最佳路线：`semantic_v2 + tree_input_dim=2048 + deep tree encoder + gated fusion`。
+
+### E4. High-dim hybrid tree attempt (`4096` dims)
+目的：进一步提升树分支表达能力，把多模态信息做得更细。
+
+本轮改动
+- 引入 `semantic_v3`，增加 `package / focusable / long-clickable / adapter-view / draw / depth / child_count / coarse spatial buckets`
+- 引入 `hybrid_hashing`，把词级和字符级 hashing 特征拼起来
+- 引入 `resnet18` 图像主干、辅助分类头、branch dropout
+- 给数据侧增加 tree text cache、tree feature precompute 和并行预处理能力
+
+结果
+- `tree_input_dim=4096` 的全量 run 在启动阶段预处理成本过高，未形成值得保留的完整有效结果。
+- 结论：在没有持久化磁盘缓存前，`4096` 维 hybrid tree 特征当前性价比太低，不适合作为默认路线。
+
+### E5. ResNet18 fast hybrid (`2048` dims)
+目的：保留 `semantic_v3 + hybrid hashing` 的核心收益，同时把预处理和训练速度拉回可迭代区间。
+
+本轮改动
+- 把 tree feature 缩到 `2048` 维
+- 加入 tree text / tree feature 并行预处理
+- 保留 `resnet18 + gated fusion + aux heads`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet_fast_20260408_182736`
+- Best val acc / macro-F1: `0.6224 / 0.5700`
+- 结论：这轮没有超过当时 best `0.6342`，但证明了并行预处理链路是有效的，后续更强 backbone 可以直接复用。
+
+### E6. ResNet34 accuracy-focused multimodal
+目的：围绕“整体 accuracy”而不是长尾宏平均，做更贴近目标函数的优化。
+
+本轮改动
+- 图像 backbone 升级为 `resnet34`
+- 取消 `weighted_random sampler`，改回自然分布训练
+- 取消 `label_smoothing`
+- 降低 `dropout / branch_dropout / auxiliary loss` 强度
+- 保留 `semantic_v3 + hybrid_hashing(2048) + gated fusion + 并行预处理`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_acc_20260408_190505`
+- Best val acc / macro-F1: `0.6591 / 0.5780`
+- 相比上一版最佳 gated 多模态：`+0.0249 acc`，`+0.0057 macro-F1`
+- Embedding: `outputs/embeddings/train_multimodal_resnet34_acc_20260408_190505_best_model`
+- Clustering: `NMI 0.4637 / ARI 0.3671 / Silhouette 0.2221`
+
+结论
+- 当前最佳路线已经从 `mobilenet_v3_small` 切换到 `resnet34`。
+- 为了冲 accuracy，取消重采样和过强正则是有效的。
+- 当前最好结果仍然离 `80% accuracy` 有明显差距，后续核心矛盾变成：更强视觉 backbone、持久化树缓存、以及是否需要更强的文本/结构编码器。
 
 ## What To Avoid Repeating
 - 不要再参考 2026-04-06 的 `1.0 / 1.0` 结果。
 - 不要把“只调训练器”误认为“多模态专项优化”；它有帮助，但不是决定性因素。
 - 不要重复尝试过于简单的 `shallow tree encoder + plain concat fusion` 方案，它已经验证过上限有限。
+- 在没有持久化缓存前，不要默认上 `4096` 维 hybrid tree 特征；启动成本太高，迭代效率不划算。
+- 如果目标优先是 overall accuracy，不要默认启用 `weighted_random sampler`；它更偏向照顾长尾类，不一定提高总体准确率。
 
 ## Current Best Result
 - Best image model: `train_image_optimized_20260407_194729`
   - `val acc 0.5723 / macro-F1 0.5009`
-- Best multimodal model: `train_multimodal_gated_20260407_210705`
-  - `val acc 0.6342 / macro-F1 0.5723`
-- Best clustering result: `train_multimodal_gated_20260407_210705_best_model`
-  - `NMI 0.4428 / ARI 0.3373 / Silhouette 0.1872`
+- Best multimodal model: `train_multimodal_resnet34_acc_20260408_190505`
+  - `val acc 0.6591 / macro-F1 0.5780`
+- Best clustering result: `train_multimodal_resnet34_acc_20260408_190505_best_model`
+  - `NMI 0.4637 / ARI 0.3671 / Silhouette 0.2221`
 
 ## Next Likely Directions
 优先级从高到低：
-1. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
-2. 在当前 gated 多模态结构上继续做小步搜索，例如 `tree_input_dim 4096`、`tree_hidden_dim 384`、`fusion_dim 384`。
-3. 针对长尾类和 `Other` 类试 `focal loss` 或更细粒度重采样，但需要和当前 `weighted_random` 分开做消融。
+1. 给 tree text / tree feature 做持久化磁盘缓存，避免每轮重算；这会直接提升后续调参效率。
+2. 在当前 accuracy 路线下继续升视觉 backbone，例如 `resnet50` 或更强的现代 backbone；当前瓶颈更像是视觉表达能力。
+3. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
+4. 如果要兼顾 macro-F1，再单独做 `sampler / focal loss / class weights` 消融；不要和 accuracy 优化混在一起判断。

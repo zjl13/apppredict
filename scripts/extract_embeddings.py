@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.feature_extraction.text import HashingVectorizer
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 
@@ -21,6 +20,7 @@ from ui_scene.data.dataset import load_manifest_records
 from ui_scene.data.image_dataset import ImageClassificationDataset
 from ui_scene.data.multimodal_dataset import MultimodalClassificationDataset
 from ui_scene.models.multimodal_model import MultimodalSceneClassifier
+from ui_scene.preprocess.tree_vectorizer import TreeTextVectorizer
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +61,15 @@ def build_image_model(backbone_name: str, num_classes: int) -> torch.nn.Module:
         model.fc = torch.nn.Linear(in_features, num_classes)
         return model
 
+    if backbone_name == 'resnet34':
+        try:
+            model = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
+        except Exception:
+            model = models.resnet34(weights=None)
+        in_features = model.fc.in_features
+        model.fc = torch.nn.Linear(in_features, num_classes)
+        return model
+
     raise ValueError(f'Unsupported backbone: {backbone_name}')
 
 
@@ -71,7 +80,7 @@ def extract_image_features(model: torch.nn.Module, backbone_name: str, images: t
         flattened = torch.flatten(pooled, 1)
         return model.classifier[:-1](flattened)
 
-    if backbone_name == 'resnet18':
+    if backbone_name in {'resnet18', 'resnet34'}:
         features = model.conv1(images)
         features = model.bn1(features)
         features = model.relu(features)
@@ -86,24 +95,21 @@ def extract_image_features(model: torch.nn.Module, backbone_name: str, images: t
     raise ValueError(f'Unsupported backbone: {backbone_name}')
 
 
-def build_collate_fn(tree_input_dim: int):
-    vectorizer = HashingVectorizer(
-        n_features=tree_input_dim,
-        alternate_sign=False,
-        norm='l2',
-    )
-
+def build_collate_fn(tree_vectorizer: TreeTextVectorizer):
     def collate_fn(batch: list[dict]) -> dict:
         images = torch.stack([item['image'] for item in batch], dim=0)
         labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
         tree_texts = [item['tree_text'] for item in batch]
-        tree_features = vectorizer.transform(tree_texts).toarray()
+        if batch and batch[0].get('tree_features') is not None:
+            tree_features = torch.stack([item['tree_features'] for item in batch], dim=0)
+        else:
+            tree_features = torch.tensor(tree_vectorizer.transform(tree_texts), dtype=torch.float32)
         return {
             'sample_id': [item['sample_id'] for item in batch],
             'label': labels,
             'label_name': [item['label_name'] for item in batch],
             'image': images,
-            'tree_features': torch.tensor(tree_features, dtype=torch.float32),
+            'tree_features': tree_features,
         }
 
     return collate_fn
@@ -167,33 +173,47 @@ def main() -> None:
                 labels.extend(batch['label'].tolist())
 
     elif task == 'multimodal_classification':
-        tree_input_dim = int(train_cfg.get('tree_input_dim', 512))
         max_tree_tokens = int(train_cfg.get('max_tree_tokens', 256))
         tree_profile = str(train_cfg.get('tree_profile', 'legacy'))
+        tree_vectorizer = TreeTextVectorizer.from_config(train_cfg)
+        precompute_tree_features = bool(train_cfg.get('precompute_tree_features', False))
+        tree_cache_workers = int(train_cfg.get('tree_cache_workers', 0))
+        tree_feature_chunk_size = int(train_cfg.get('tree_feature_chunk_size', 2048))
         dataset = MultimodalClassificationDataset(
             records,
             label_to_index,
             image_transform=eval_transform,
             max_tree_nodes=max_tree_tokens,
             tree_profile=tree_profile,
+            tree_cache_workers=tree_cache_workers,
         )
+        if precompute_tree_features:
+            dataset.set_tree_feature_matrix(
+                tree_vectorizer.transform_parallel(
+                    dataset.tree_texts,
+                    num_workers=tree_cache_workers,
+                    chunk_size=tree_feature_chunk_size,
+                )
+            )
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=build_collate_fn(tree_input_dim),
+            collate_fn=build_collate_fn(tree_vectorizer),
             **loader_kwargs,
         )
         model = MultimodalSceneClassifier(
             backbone_name=model_cfg['image_backbone'],
             image_dim=int(model_cfg.get('image_dim', model_cfg.get('fusion_dim', 256))),
-            tree_input_dim=tree_input_dim,
+            tree_input_dim=tree_vectorizer.output_dim,
             tree_dim=int(model_cfg.get('tree_hidden_dim', 128)),
             fusion_dim=int(model_cfg.get('fusion_dim', 256)),
             num_classes=len(label_to_index),
             fusion_mode=str(model_cfg.get('fusion_mode', 'concat')),
             tree_encoder_type=str(model_cfg.get('tree_encoder_type', 'simple')),
             dropout=float(model_cfg.get('dropout', 0.1)),
+            use_aux_heads=bool(model_cfg.get('use_aux_heads', False)),
+            branch_dropout=float(model_cfg.get('branch_dropout', 0.0)),
         )
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
