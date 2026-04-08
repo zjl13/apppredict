@@ -1,0 +1,25 @@
+defaults:
+  - base
+
+train:
+  task: image_classification
+  batch_size: 32
+  epochs: 10
+  learning_rate: 0.0003
+  image_size: 224
+  num_workers: 8
+  weight_decay: 0.0005
+  use_class_weights: false
+  sampler: weighted_random
+  label_smoothing: 0.05
+  use_amp: true
+  augmentation: ui_light
+  output_name: train_image_optimized
+  optimizer:
+    name: adamw
+  scheduler:
+    name: cosine
+    eta_min: 0.000001
+
+model:
+  image_backbone: mobilenet_v3_small

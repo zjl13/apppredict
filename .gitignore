@@ -1,0 +1,16 @@
+# Local data and experiment artifacts
+data_qwen_split/
+outputs/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*
+
+# Virtual environments
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store

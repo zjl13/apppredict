@@ -1,0 +1,9 @@
+[project]
+name = "ui-scene-semantic"
+version = "0.1.0"
+description = "Lightweight multimodal mobile UI scene understanding project."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

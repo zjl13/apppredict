@@ -1,0 +1,20 @@
+defaults:
+  - base
+
+train:
+  task: multimodal_classification
+  batch_size: 16
+  epochs: 20
+  learning_rate: 0.0005
+  image_size: 224
+  max_tree_tokens: 256
+  tree_input_dim: 512
+  num_workers: 8
+  weight_decay: 0.0001
+  use_class_weights: true
+  output_name: train_multimodal_baseline
+
+model:
+  image_backbone: mobilenet_v3_small
+  tree_hidden_dim: 128
+  fusion_dim: 256

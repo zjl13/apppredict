@@ -1,0 +1,29 @@
+defaults:
+  - base
+
+train:
+  task: multimodal_classification
+  batch_size: 16
+  epochs: 10
+  learning_rate: 0.0002
+  image_size: 224
+  max_tree_tokens: 256
+  tree_input_dim: 512
+  num_workers: 8
+  weight_decay: 0.0005
+  use_class_weights: false
+  sampler: weighted_random
+  label_smoothing: 0.05
+  use_amp: true
+  augmentation: ui_light
+  output_name: train_multimodal_optimized
+  optimizer:
+    name: adamw
+  scheduler:
+    name: cosine
+    eta_min: 0.000001
+
+model:
+  image_backbone: mobilenet_v3_small
+  tree_hidden_dim: 128
+  fusion_dim: 256

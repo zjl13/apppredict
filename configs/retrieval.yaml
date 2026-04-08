@@ -1,0 +1,11 @@
+defaults:
+  - base
+
+retrieval:
+  top_k: [1, 5, 10]
+  metric: cosine
+
+clustering:
+  method: kmeans
+  num_clusters: 22
+
