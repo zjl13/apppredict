@@ -1,0 +1,54 @@
+defaults:
+  - base
+
+train:
+  task: multimodal_classification
+  batch_size: 20
+  epochs: 6
+  learning_rate: 0.00003
+  image_size: 256
+  max_tree_tokens: 256
+  tree_input_dim: 4096
+  tree_profile: semantic_v3
+  num_workers: 8
+  weight_decay: 0.0003
+  use_class_weights: false
+  sampler: none
+  label_smoothing: 0.0
+  use_amp: true
+  augmentation: ui_light
+  output_name: train_multimodal_resnet34_hybrid4096_refine256
+  resume_from: outputs/runs/train_multimodal_resnet34_hybrid4096_revisit_20260409_190439/best_model.pt
+  freeze_backbone_epochs: 0
+  precompute_tree_features: true
+  tree_cache_workers: 12
+  tree_feature_chunk_size: 2048
+  tree_vectorizer:
+    name: hybrid_hashing
+    word_dim: 2048
+    char_dim: 2048
+    word_ngram_range: [1, 2]
+    char_ngram_range: [3, 5]
+  ema:
+    use: true
+    decay: 0.999
+  auxiliary_loss:
+    image_weight: 0.05
+    tree_weight: 0.05
+  optimizer:
+    name: adamw
+    backbone_lr_scale: 0.25
+  scheduler:
+    name: cosine
+    eta_min: 0.000001
+
+model:
+  image_backbone: resnet34
+  image_dim: 512
+  tree_hidden_dim: 384
+  fusion_dim: 512
+  tree_encoder_type: deep
+  fusion_mode: gated
+  dropout: 0.10
+  use_aux_heads: true
+  branch_dropout: 0.01

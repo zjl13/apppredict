@@ -281,6 +281,48 @@
 - 在持久化缓存可用之后，这条路线不仅能完整跑通，而且带来了当前最好的分类结果。
 - 这轮也说明：相比围绕旧 checkpoint 反复做低风险续训，给 tree branch 增加新的可用信息增量更有效。
 
+### E13. 4096-best refine with 288 resolution
+目的：验证新的 `4096` best checkpoint 是否还能像旧 `2048` 路线那样，通过更高分辨率 `288`、`EMA` 和低学习率续训再挤一档分数。
+
+本轮改动
+- 从当前 best `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439` checkpoint 继续训练
+- 保留 `EMA + backbone_lr_scale + 低学习率 refine` 思路
+- 关键变化是把图像分辨率从 `256` 提到 `288`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_hybrid4096_refine_20260409_195046`
+- Best val acc / macro-F1: `0.6685 / 0.5899`
+- 明显低于当前 `4096` best `0.6732 / 0.5991`
+- 连续 3 个 epoch 都没有追上 best，因此提前停止
+
+结论
+- 对新的 `4096` best 而言，直接切到 `288` 分辨率会带来稳定掉点。
+- 这说明旧 `2048` 路线有效的 refine 手法，不能不加甄别地直接迁移到新的强树表征版本上。
+- 后续如果继续围绕 `4096` best 做 refine，应优先保持原分辨率 `256`。
+
+### E14. 4096-best refine at native 256 resolution
+目的：在不改变当前 best 输入尺度的前提下，验证 `EMA + 低学习率 + 较小 backbone 步长` 能否在新的 `4096` best 上继续带来小幅增益。
+
+本轮改动
+- 从当前 best `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439` checkpoint 继续训练
+- 保持原始 `256` 分辨率不变
+- 启用 `EMA(decay=0.999)`
+- 使用 `learning_rate=3e-5`、`backbone_lr_scale=0.25`
+- 把辅助损失权重收敛到 `0.05 / 0.05`，保留轻量分支正则 `branch_dropout=0.01`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_hybrid4096_refine256_20260409_195921`
+- Best val acc / macro-F1: `0.6742 / 0.6018`
+- 最佳点出现在 `epoch 1`
+- 相比上一版 best `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439`：`+0.0011 acc`，`+0.0027 macro-F1`
+- Embedding: `outputs/embeddings/train_multimodal_resnet34_hybrid4096_refine256_20260409_195921_best_model`
+- Clustering: `NMI 0.4774 / ARI 0.3830 / Silhouette 0.2216`
+
+结论
+- 对新的 `4096` best 而言，真正有效的 refine 是“保留原分辨率，再做温和的 EMA 续训”。
+- 分类和聚类都再次刷新，说明这次提升不是偶然波动，而是表示空间也更稳了。
+- 当前最优路线已经变成：`semantic_v3 + hybrid_hashing(4096) + gated fusion + resnet34 + native-256 EMA refine`。
+
 ## What To Avoid Repeating
 - 不要再参考 2026-04-06 的 `1.0 / 1.0` 结果。
 - 不要把“只调训练器”误认为“多模态专项优化”；它有帮助，但不是决定性因素。
@@ -292,21 +334,22 @@
 - 不要原样重跑 `train_multimodal_resnet50_acc` 这套 `12 epoch + ImageNet init + freeze_backbone_epochs=1` 配置；它完整跑完后仍明显低于当前 best。
 - 不要把当前 best refine 路线的 `auxiliary_loss` 和 `branch_dropout` 一次性全部拿掉；这会让续训在前两轮就明显掉点。
 - 不要原样重跑基于当前 best checkpoint 的“更低学习率 stage-2 refine”方案；它也没有带来提升。
+- 不要把新的 `4096` best 直接切到 `288` 分辨率做 refine；这条路线已经验证会稳定低于 native-256 best。
 
 ## Current Best Result
 - Best image model: `train_image_optimized_20260407_194729`
   - `val acc 0.5723 / macro-F1 0.5009`
-- Best multimodal classification model: `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439`
-  - `val acc 0.6732 / macro-F1 0.5991`
-- Best multimodal clustering result by NMI / ARI: `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439_best_model`
-  - `NMI 0.4767 / ARI 0.3737 / Silhouette 0.2120`
+- Best multimodal classification model: `train_multimodal_resnet34_hybrid4096_refine256_20260409_195921`
+  - `val acc 0.6742 / macro-F1 0.6018`
+- Best multimodal clustering result by NMI / ARI: `train_multimodal_resnet34_hybrid4096_refine256_20260409_195921_best_model`
+  - `NMI 0.4774 / ARI 0.3830 / Silhouette 0.2216`
 - Best multimodal clustering silhouette so far: `train_multimodal_resnet34_acc_20260408_190505_best_model`
   - `Silhouette 0.2221`
 
 ## Next Likely Directions
 优先级从高到低：
-1. 在新的 `4096` best checkpoint 上补一轮真正轻量的低学习率 refine，验证它是否还能在更强 tree 表征基础上继续往上走。
-2. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
-3. 继续优化当前 `memmap + DataLoader workers` 的数据路径，降低 `4096` 路线的 CPU-bound 程度，提高后续迭代效率。
+1. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
+2. 继续优化当前 `memmap + DataLoader workers` 的数据路径，降低 `4096` 路线的 CPU-bound 程度，提高后续迭代效率。
+3. 以新的 `4096 + native-256 EMA refine` 为起点，尝试更细的训练日程控制，比如更早 early stopping 或更短 schedule，而不是再盲目拉长 epoch。
 4. 如果后续再碰更强视觉 backbone，优先考虑更合理的迁移或更长 schedule，而不是原样重跑这版从 ImageNet 直接起步的 `resnet50` 配置。
 5. 如果再回到“跨 app 语义对齐”方向，优先补 app-aware batch sampler 或更严格的跨 domain 正样本构造，而不是原样重跑当前这版 `SupCon + GRL`。
