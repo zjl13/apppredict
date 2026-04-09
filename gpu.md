@@ -178,6 +178,109 @@
 - 持久化树缓存已经跑通，后续同类配置不需要每轮都重算 tree text / tree feature。
 - 当前 `memmap + 多 worker + 288 分辨率` 组合仍然偏 CPU-bound，且最佳点出现很早；后续应优先做更轻的数据路径或 early stopping，而不是盲目拉长 epoch。
 
+### E8. Suggestion-driven objective reshaping (`CE + SupCon + domain adversarial`)
+目的：按 `建议.md` 的高优先级方向，在不更换当前 best backbone / fusion 路线的前提下，测试“跨 app 语义对齐”是否能直接带来分类增益。
+
+本轮改动
+- 在 fused embedding 上加入 `Supervised Contrastive Loss`
+- 新增轻量 `domain adversarial head`，通过 `GRL` 约束表示尽量弱化 app / package domain 信息
+- domain 定义采用从 tree text 中提取的 coarse package name，保留 `top-128` 高频 domain，其余归入 `__other__`
+- 训练从当前 best `train_multimodal_resnet34_refine_20260409_103229` checkpoint 继续微调
+- 保持 `resnet34 + semantic_v3 + hybrid_hashing(2048) + gated fusion + EMA + 288 分辨率` 不变，避免把结果混到 backbone 变化里
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_supcon_domain_20260409_164635`
+- Best val acc / macro-F1: `0.6614 / 0.5832`
+- 这个 best 实际出现在 `epoch 0` 的 resume eval，之后 `epoch 1-6` 持续回落，最终到 `0.6531 / 0.5679`
+- 相比当前 best `train_multimodal_resnet34_refine_20260409_103229`：`-0.0002 acc`，`-0.0003 macro-F1`
+
+结论
+- `建议.md` 里“目标函数改造”的总体方向值得关注，但当前这版轻量实现没有带来分类提升。
+- 在现有采样与 domain 定义下，`SupCon + GRL` 更像是额外约束，拉低了主任务收敛效率。
+- 当前可以确认的是：不要直接复用这套配置和权重指望拿到更高 accuracy。
+- 如果后续还要重试这条路线，应同时引入更贴任务的正负样本构造或 app-aware batch sampler，而不是只把两个 loss 直接挂上去。
+
+### E9. ResNet50 stronger-backbone attempt from ImageNet init
+目的：验证 `gpu.md` 中“更强视觉 backbone”这条路线，看看仅通过提升图像主干容量，能否在当前多模态配方上继续推高 accuracy。
+
+本轮改动
+- 在代码里补充 `resnet50` backbone 支持，保持现有 `semantic_v3 + hybrid_hashing(2048) + gated fusion` 不变
+- 使用新的 `configs/train_multimodal_resnet50_acc.yaml`
+- 训练从 ImageNet 预训练初始化开始，不使用旧 `resnet34` checkpoint 续训
+- 使用 `batch_size=16 / image_size=288 / EMA / backbone_lr_scale=0.25 / freeze_backbone_epochs=1`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet50_acc_20260409_171605`
+- Best val acc / macro-F1: `0.5938 / 0.4889`
+- 12 个 epoch 正常跑完，没有进程异常或 OOM
+- 最佳点出现在 `epoch 12`，说明它还在学习，但当前配置下明显落后于现有 best `0.6615 / 0.5834`
+
+结论
+- 这次不是“训练挂了”，而是“这套 resnet50 从头接多模态头的配置效果不够好”。
+- 因为完整 12 epoch 已经跑完且明显落后，所以不值得重启同一配置。
+- 如果后续还要重试更强 backbone，应该优先调整训练日程或迁移方式，而不是原样重跑这版 `resnet50` 配置。
+
+### E10. ResNet34 refine with too little regularization
+目的：验证当前 best checkpoint 在后续精调阶段，是否已经不再需要 auxiliary heads loss 和 branch dropout 这类额外正则。
+
+本轮改动
+- 从当前 best `train_multimodal_resnet34_refine_20260409_103229` checkpoint 继续训练
+- 将 `auxiliary_loss` 从 `0.05 / 0.05` 直接降到 `0.0 / 0.0`
+- 将 `branch_dropout` 从 `0.01` 降到 `0.0`
+- 同时把学习率压到 `3e-5`，尝试做一次更“干净”的二阶段 refine
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_refine_noreg_20260409_183451`
+- Resume eval 的 best val acc / macro-F1: `0.6614 / 0.5832`
+- 实际训练到 `epoch 1` 就掉到 `0.6550 / 0.5726`，`epoch 2` 继续掉到 `0.6525 / 0.5711`
+- 因为连续两轮都明显差于 resume baseline，所以提前停止，没有继续浪费 GPU
+
+结论
+- 当前 best 路线还不能把辅助监督和分支级正则一起拿掉。
+- 这类“去正则精调”会让续训很快过拟合，至少在当前数据和学习率区间下不是有效方向。
+- 如果还要继续 refine，更合理的是保留原有结构，只做更温和的学习率和时长调整。
+
+### E11. ResNet34 gentle stage-2 refine
+目的：验证是否能在完全保留当前 best 结构与正则的前提下，仅靠更低学习率和更短续训，再从 best checkpoint 挤出一点额外收益。
+
+本轮改动
+- 从当前 best `train_multimodal_resnet34_refine_20260409_103229` checkpoint 继续训练
+- 保留 `auxiliary_loss=0.05 / 0.05`、`branch_dropout=0.01`、`dropout=0.10`
+- 只把学习率降到 `2e-5`，把 `backbone_lr_scale` 降到 `0.15`，总 epoch 缩到 `4`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_refine_stage2_20260409_185223`
+- Resume eval 的 best val acc / macro-F1: `0.6614 / 0.5832`
+- `epoch 1` 降到 `0.6559 / 0.5749`，`epoch 2` 继续到 `0.6540 / 0.5749`
+- 因为前两轮都没有接近或超过当前 best，所以提前停止
+
+结论
+- 当前 best checkpoint 周围，单纯靠更小学习率的二阶段续训也没有带来提升。
+- 这说明 `train_multimodal_resnet34_refine_20260409_103229` 附近已经比较接近局部最优，继续做“续训挤分”性价比很低。
+- 下一步应优先回到有新信息增量的方向，例如更强的 tree 表征，而不是围绕同一 checkpoint 反复微调。
+
+### E12. Revisit 4096-dim hybrid tree with persistent cache
+目的：重新验证当初因为预处理成本太高而搁置的 `4096` 维 hybrid tree 路线，并确认在持久化缓存已经成熟后，它到底是“工程上跑不动”还是“建模上没价值”。
+
+本轮改动
+- 保持 `resnet34 + semantic_v3 + gated fusion` 不变，主要变量只放在 tree 表征上
+- 将 tree vectorizer 从 `hybrid_hashing(2048)` 提升到 `hybrid_hashing(4096)`，即 `word_dim=2048 + char_dim=2048`
+- 依赖现在已经跑通的 tree text / tree feature 持久化缓存与并行预处理能力
+- 训练配置回到更接近 `resnet34_acc` 的从头训练路线，而不是继续围绕当前 best checkpoint 做小幅续训
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_hybrid4096_revisit_20260409_190439`
+- Best val acc / macro-F1: `0.6732 / 0.5991`
+- 最佳点出现在 `epoch 12`
+- 相比上一版 best `train_multimodal_resnet34_refine_20260409_103229`：`+0.0117 acc`，`+0.0157 macro-F1`
+- Embedding: `outputs/embeddings/train_multimodal_resnet34_hybrid4096_revisit_20260409_190439_best_model`
+- Clustering: `NMI 0.4767 / ARI 0.3737 / Silhouette 0.2120`
+
+结论
+- `4096` 维 hybrid tree 并不是方向错了，之前的主要问题确实是工程链路还不够成熟。
+- 在持久化缓存可用之后，这条路线不仅能完整跑通，而且带来了当前最好的分类结果。
+- 这轮也说明：相比围绕旧 checkpoint 反复做低风险续训，给 tree branch 增加新的可用信息增量更有效。
+
 ## What To Avoid Repeating
 - 不要再参考 2026-04-06 的 `1.0 / 1.0` 结果。
 - 不要把“只调训练器”误认为“多模态专项优化”；它有帮助，但不是决定性因素。
@@ -185,18 +288,25 @@
 - 在没有持久化缓存前，不要默认上 `4096` 维 hybrid tree 特征；启动成本太高，迭代效率不划算。
 - 如果目标优先是 overall accuracy，不要默认启用 `weighted_random sampler`；它更偏向照顾长尾类，不一定提高总体准确率。
 - 对高分辨率 refine 路线，不要默认把续训 epoch 拉太长；当前 best 出现在 `epoch 2`，后续主要是缓慢过拟合。
+- 不要直接重复 `train_multimodal_resnet34_supcon_domain` 这套 `SupCon(weight=0.08) + domain adversarial(weight=0.03, top-128 coarse domains)` 配置；它没有超过 resume baseline，且训练后期持续掉点。
+- 不要原样重跑 `train_multimodal_resnet50_acc` 这套 `12 epoch + ImageNet init + freeze_backbone_epochs=1` 配置；它完整跑完后仍明显低于当前 best。
+- 不要把当前 best refine 路线的 `auxiliary_loss` 和 `branch_dropout` 一次性全部拿掉；这会让续训在前两轮就明显掉点。
+- 不要原样重跑基于当前 best checkpoint 的“更低学习率 stage-2 refine”方案；它也没有带来提升。
 
 ## Current Best Result
 - Best image model: `train_image_optimized_20260407_194729`
   - `val acc 0.5723 / macro-F1 0.5009`
-- Best multimodal classification model: `train_multimodal_resnet34_refine_20260409_103229`
-  - `val acc 0.6615 / macro-F1 0.5834`
-- Best multimodal clustering result: `train_multimodal_resnet34_acc_20260408_190505_best_model`
-  - `NMI 0.4637 / ARI 0.3671 / Silhouette 0.2221`
+- Best multimodal classification model: `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439`
+  - `val acc 0.6732 / macro-F1 0.5991`
+- Best multimodal clustering result by NMI / ARI: `train_multimodal_resnet34_hybrid4096_revisit_20260409_190439_best_model`
+  - `NMI 0.4767 / ARI 0.3737 / Silhouette 0.2120`
+- Best multimodal clustering silhouette so far: `train_multimodal_resnet34_acc_20260408_190505_best_model`
+  - `Silhouette 0.2221`
 
 ## Next Likely Directions
 优先级从高到低：
-1. 先把当前 best refine checkpoint 补跑 embedding / clustering，确认分类提升是否也能带来表示空间收益。
-2. 优先优化当前 `memmap + DataLoader workers` 的数据路径，降低 CPU-bound 程度；缓存已经有了，下一步要把读取链路也做轻。
-3. 在当前 accuracy 路线下继续尝试更强视觉 backbone，例如 `resnet50` 或更强的现代 backbone；当前瓶颈仍然更像视觉表达能力。
-4. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
+1. 在新的 `4096` best checkpoint 上补一轮真正轻量的低学习率 refine，验证它是否还能在更强 tree 表征基础上继续往上走。
+2. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
+3. 继续优化当前 `memmap + DataLoader workers` 的数据路径，降低 `4096` 路线的 CPU-bound 程度，提高后续迭代效率。
+4. 如果后续再碰更强视觉 backbone，优先考虑更合理的迁移或更长 schedule，而不是原样重跑这版从 ImageNet 直接起步的 `resnet50` 配置。
+5. 如果再回到“跨 app 语义对齐”方向，优先补 app-aware batch sampler 或更严格的跨 domain 正样本构造，而不是原样重跑当前这版 `SupCon + GRL`。
