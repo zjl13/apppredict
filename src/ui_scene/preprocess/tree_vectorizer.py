@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 from sklearn.feature_extraction.text import HashingVectorizer
@@ -112,6 +115,10 @@ class TreeTextVectorizer:
             'char_ngram_range': self.char_ngram_range,
         }
 
+    def config_hash(self) -> str:
+        payload = json.dumps(self.to_config(), ensure_ascii=True, sort_keys=True)
+        return hashlib.sha1(payload.encode('utf-8')).hexdigest()[:16]
+
     def transform(self, texts: list[str]) -> np.ndarray:
         if self.strategy == 'word_hashing':
             return self.word_vectorizer.transform(texts).toarray().astype(np.float32, copy=False)
@@ -128,12 +135,23 @@ class TreeTextVectorizer:
         texts: list[str],
         num_workers: int = 0,
         chunk_size: int = 2048,
+        cache_path: str | Path | None = None,
     ) -> np.ndarray:
-        if num_workers <= 1 or len(texts) <= chunk_size:
-            return self.transform(texts)
+        resolved_cache_path = Path(cache_path) if cache_path is not None else None
+        if resolved_cache_path is not None and resolved_cache_path.exists():
+            return np.load(resolved_cache_path, mmap_mode='r')
 
-        config = self.to_config()
-        chunks = [texts[index:index + chunk_size] for index in range(0, len(texts), chunk_size)]
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            arrays = list(executor.map(_transform_chunk, [(config, chunk) for chunk in chunks]))
-        return np.concatenate(arrays, axis=0) if arrays else np.empty((0, self.output_dim), dtype=np.float32)
+        if num_workers <= 1 or len(texts) <= chunk_size:
+            features = self.transform(texts)
+        else:
+            config = self.to_config()
+            chunks = [texts[index:index + chunk_size] for index in range(0, len(texts), chunk_size)]
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                arrays = list(executor.map(_transform_chunk, [(config, chunk) for chunk in chunks]))
+            features = np.concatenate(arrays, axis=0) if arrays else np.empty((0, self.output_dim), dtype=np.float32)
+
+        if resolved_cache_path is not None:
+            resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(resolved_cache_path, features)
+            return np.load(resolved_cache_path, mmap_mode='r')
+        return features

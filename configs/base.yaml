@@ -6,8 +6,8 @@ paths:
   data_root: data_qwen_split
   manifest_root: data_qwen_split/manifests
   output_root: outputs
+  cache_root: outputs/cache
 
 model:
   num_classes: 22
   embedding_dim: 256
-

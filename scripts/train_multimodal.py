@@ -21,6 +21,7 @@ from ui_scene.data.dataset import build_label_to_index, load_manifest_records
 from ui_scene.data.multimodal_dataset import MultimodalClassificationDataset
 from ui_scene.engine.metrics import accuracy, confusion_matrix, macro_f1
 from ui_scene.engine.training import (
+    ModelEMA,
     build_class_weights,
     build_criterion,
     build_loader_kwargs,
@@ -104,6 +105,41 @@ def build_collate_fn(tree_vectorizer: TreeTextVectorizer):
         }
 
     return collate_fn
+
+
+def build_tree_feature_cache_path(
+    cache_root: Path,
+    dataset: MultimodalClassificationDataset,
+    tree_vectorizer: TreeTextVectorizer,
+) -> Path:
+    return cache_root / 'tree_features' / (
+        f'{dataset.split_name}_{dataset.cache_key}_{tree_vectorizer.config_hash()}.npy'
+    )
+
+
+def build_optimizer_parameters(
+    model: MultimodalSceneClassifier,
+    learning_rate: float,
+    backbone_lr_scale: float,
+):
+    if abs(backbone_lr_scale - 1.0) < 1e-9:
+        return model.parameters()
+
+    backbone_params = []
+    head_params = []
+    backbone_param_ids = {id(parameter) for parameter in model.image_backbone.parameters()}
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        if id(parameter) in backbone_param_ids:
+            backbone_params.append(parameter)
+        else:
+            head_params.append(parameter)
+
+    return [
+        {'params': backbone_params, 'lr': learning_rate * backbone_lr_scale},
+        {'params': head_params, 'lr': learning_rate},
+    ]
 
 
 def save_snapshot(
@@ -209,9 +245,14 @@ def main() -> None:
     aux_cfg = train_cfg.get('auxiliary_loss', {}) or {}
     image_aux_weight = float(aux_cfg.get('image_weight', 0.0))
     tree_aux_weight = float(aux_cfg.get('tree_weight', 0.0))
+    ema_cfg = train_cfg.get('ema', {}) or {}
+    ema_enabled = bool(ema_cfg.get('use', False))
+    ema_decay = float(ema_cfg.get('decay', 0.999))
+    backbone_lr_scale = float(optimizer_cfg.get('backbone_lr_scale', 1.0))
 
     manifest_root = Path(path_cfg['manifest_root'])
     output_root = Path(path_cfg['output_root'])
+    cache_root = Path(path_cfg.get('cache_root', output_root / 'cache'))
     run_name = str(train_cfg.get('output_name', 'train_multimodal'))
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir = output_root / 'runs' / f'{run_name}_{timestamp}'
@@ -233,6 +274,7 @@ def main() -> None:
         max_tree_nodes=max_tree_tokens,
         tree_profile=tree_profile,
         tree_cache_workers=tree_cache_workers,
+        cache_root=cache_root,
     )
     val_dataset = MultimodalClassificationDataset(
         val_records,
@@ -241,6 +283,7 @@ def main() -> None:
         max_tree_nodes=max_tree_tokens,
         tree_profile=tree_profile,
         tree_cache_workers=tree_cache_workers,
+        cache_root=cache_root,
     )
     use_cuda = torch.cuda.is_available()
     if use_cuda:
@@ -258,6 +301,7 @@ def main() -> None:
                 train_dataset.tree_texts,
                 num_workers=tree_cache_workers,
                 chunk_size=tree_feature_chunk_size,
+                cache_path=build_tree_feature_cache_path(cache_root, train_dataset, tree_vectorizer),
             )
         )
         print('Precomputing val tree features...')
@@ -266,6 +310,7 @@ def main() -> None:
                 val_dataset.tree_texts,
                 num_workers=tree_cache_workers,
                 chunk_size=tree_feature_chunk_size,
+                cache_path=build_tree_feature_cache_path(cache_root, val_dataset, tree_vectorizer),
             )
         )
     loader_kwargs = build_loader_kwargs(
@@ -318,7 +363,7 @@ def main() -> None:
         label_smoothing=label_smoothing,
     )
     optimizer = build_optimizer(
-        model.parameters(),
+        build_optimizer_parameters(model, learning_rate, backbone_lr_scale),
         optimizer_name=optimizer_name,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
@@ -329,6 +374,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     best_val_acc = -1.0
     history: list[dict] = []
+    ema_helper = ModelEMA(model, decay=ema_decay) if ema_enabled else None
 
     print(f'Device: {device}')
     print(f'Train samples: {len(train_dataset)}')
@@ -340,8 +386,13 @@ def main() -> None:
     print(f'Tree vectorizer: {tree_vectorizer.strategy} ({tree_vectorizer.output_dim} dims)')
     print(f'Precompute tree features: {precompute_tree_features}')
     print(f'Tree cache workers: {tree_cache_workers}')
-    print(f"Fusion mode: {model_cfg.get('fusion_mode', 'concat')}")
+    print(f'Fusion mode: {model_cfg.get("fusion_mode", "concat")}')
     print(f'Freeze backbone epochs: {freeze_backbone_epochs}')
+    print(f'Cache root: {cache_root}')
+    print(f'Backbone LR scale: {backbone_lr_scale}')
+    print(f'EMA enabled: {ema_enabled}')
+    if ema_enabled:
+        print(f'EMA decay: {ema_decay}')
     if image_aux_weight > 0.0 or tree_aux_weight > 0.0:
         print(f'Auxiliary loss weights: image={image_aux_weight} tree={tree_aux_weight}')
     non_blocking = device.type == 'cuda'
@@ -354,7 +405,7 @@ def main() -> None:
 
     if resume_from:
         initial_metrics = evaluate(
-            model,
+            ema_helper.ema_model if ema_helper is not None else model,
             val_loader,
             device,
             len(label_to_index),
@@ -373,7 +424,14 @@ def main() -> None:
                 },
             }
         )
-        save_snapshot(run_dir, model, label_to_index, config, initial_metrics, index_to_label)
+        save_snapshot(
+            run_dir,
+            ema_helper.ema_model if ema_helper is not None else model,
+            label_to_index,
+            config,
+            initial_metrics,
+            index_to_label,
+        )
         print(
             'Resume eval | '
             f"val_loss={initial_metrics['loss']:.4f} "
@@ -420,6 +478,8 @@ def main() -> None:
             else:
                 loss.backward()
                 optimizer.step()
+            if ema_helper is not None:
+                ema_helper.update(model)
 
             running_loss += float(loss.item())
             predictions.extend(logits.argmax(dim=1).detach().cpu().tolist())
@@ -434,7 +494,7 @@ def main() -> None:
             'macro_f1': macro_f1(predictions, labels),
         }
         val_metrics = evaluate(
-            model,
+            ema_helper.ema_model if ema_helper is not None else model,
             val_loader,
             device,
             len(label_to_index),
@@ -464,7 +524,14 @@ def main() -> None:
 
         if val_metrics['accuracy'] > best_val_acc:
             best_val_acc = val_metrics['accuracy']
-            save_snapshot(run_dir, model, label_to_index, config, val_metrics, index_to_label)
+            save_snapshot(
+                run_dir,
+                ema_helper.ema_model if ema_helper is not None else model,
+                label_to_index,
+                config,
+                val_metrics,
+                index_to_label,
+            )
 
     with (run_dir / 'history.json').open('w', encoding='utf-8') as fp:
         json.dump(history, fp, ensure_ascii=False, indent=2)

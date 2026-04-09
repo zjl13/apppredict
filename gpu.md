@@ -156,24 +156,47 @@
 - 为了冲 accuracy，取消重采样和过强正则是有效的。
 - 当前最好结果仍然离 `80% accuracy` 有明显差距，后续核心矛盾变成：更强视觉 backbone、持久化树缓存、以及是否需要更强的文本/结构编码器。
 
+### E7. ResNet34 refine with EMA + higher resolution
+目的：在当前 best checkpoint 基础上做低学习率精调，看看更高分辨率和更稳的优化策略能否继续往上挤 accuracy。
+
+本轮改动
+- 从 `train_multimodal_resnet34_acc_20260408_190505` 的 best checkpoint 继续训练
+- 图像尺寸从 `256` 提到 `288`
+- 引入 `EMA`
+- 给 image backbone 使用 `0.35x` 学习率，head 保持基础学习率
+- 引入 tree text / tree feature 持久化磁盘缓存
+- 进一步下调 `auxiliary loss / dropout / branch_dropout`
+
+结果
+- Run: `outputs/runs/train_multimodal_resnet34_refine_20260409_103229`
+- Best val acc / macro-F1: `0.6615 / 0.5834`
+- 相比上一版最佳 `train_multimodal_resnet34_acc_20260408_190505`：`+0.0024 acc`，`+0.0054 macro-F1`
+- Best 出现在 `epoch 2`，后续 epoch 缓慢回落
+
+结论
+- 这轮是有效提升，但幅度不大，更像是“精调挤分”而不是路线级跃迁。
+- 持久化树缓存已经跑通，后续同类配置不需要每轮都重算 tree text / tree feature。
+- 当前 `memmap + 多 worker + 288 分辨率` 组合仍然偏 CPU-bound，且最佳点出现很早；后续应优先做更轻的数据路径或 early stopping，而不是盲目拉长 epoch。
+
 ## What To Avoid Repeating
 - 不要再参考 2026-04-06 的 `1.0 / 1.0` 结果。
 - 不要把“只调训练器”误认为“多模态专项优化”；它有帮助，但不是决定性因素。
 - 不要重复尝试过于简单的 `shallow tree encoder + plain concat fusion` 方案，它已经验证过上限有限。
 - 在没有持久化缓存前，不要默认上 `4096` 维 hybrid tree 特征；启动成本太高，迭代效率不划算。
 - 如果目标优先是 overall accuracy，不要默认启用 `weighted_random sampler`；它更偏向照顾长尾类，不一定提高总体准确率。
+- 对高分辨率 refine 路线，不要默认把续训 epoch 拉太长；当前 best 出现在 `epoch 2`，后续主要是缓慢过拟合。
 
 ## Current Best Result
 - Best image model: `train_image_optimized_20260407_194729`
   - `val acc 0.5723 / macro-F1 0.5009`
-- Best multimodal model: `train_multimodal_resnet34_acc_20260408_190505`
-  - `val acc 0.6591 / macro-F1 0.5780`
-- Best clustering result: `train_multimodal_resnet34_acc_20260408_190505_best_model`
+- Best multimodal classification model: `train_multimodal_resnet34_refine_20260409_103229`
+  - `val acc 0.6615 / macro-F1 0.5834`
+- Best multimodal clustering result: `train_multimodal_resnet34_acc_20260408_190505_best_model`
   - `NMI 0.4637 / ARI 0.3671 / Silhouette 0.2221`
 
 ## Next Likely Directions
 优先级从高到低：
-1. 给 tree text / tree feature 做持久化磁盘缓存，避免每轮重算；这会直接提升后续调参效率。
-2. 在当前 accuracy 路线下继续升视觉 backbone，例如 `resnet50` 或更强的现代 backbone；当前瓶颈更像是视觉表达能力。
-3. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。
-4. 如果要兼顾 macro-F1，再单独做 `sampler / focal loss / class weights` 消融；不要和 accuracy 优化混在一起判断。
+1. 先把当前 best refine checkpoint 补跑 embedding / clustering，确认分类提升是否也能带来表示空间收益。
+2. 优先优化当前 `memmap + DataLoader workers` 的数据路径，降低 CPU-bound 程度；缓存已经有了，下一步要把读取链路也做轻。
+3. 在当前 accuracy 路线下继续尝试更强视觉 backbone，例如 `resnet50` 或更强的现代 backbone；当前瓶颈仍然更像视觉表达能力。
+4. 增加独立 `test` 分类评估脚本，导出每类 precision / recall / F1 和 confusion matrix 摘要，方便答辩与定向调参。

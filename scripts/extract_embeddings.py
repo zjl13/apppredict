@@ -115,6 +115,16 @@ def build_collate_fn(tree_vectorizer: TreeTextVectorizer):
     return collate_fn
 
 
+def build_tree_feature_cache_path(
+    cache_root: Path,
+    dataset: MultimodalClassificationDataset,
+    tree_vectorizer: TreeTextVectorizer,
+) -> Path:
+    return cache_root / 'tree_features' / (
+        f'{dataset.split_name}_{dataset.cache_key}_{tree_vectorizer.config_hash()}.npy'
+    )
+
+
 def main() -> None:
     args = parse_args()
     checkpoint_path = Path(args.checkpoint)
@@ -135,6 +145,8 @@ def main() -> None:
     image_size = int(train_cfg['image_size'])
     batch_size = int(args.batch_size)
     num_workers = int(train_cfg.get('num_workers', 0))
+    output_root = Path(path_cfg['output_root'])
+    cache_root = Path(path_cfg.get('cache_root', output_root / 'cache'))
     eval_transform = build_eval_transform(image_size)
 
     use_cuda = torch.cuda.is_available()
@@ -186,6 +198,7 @@ def main() -> None:
             max_tree_nodes=max_tree_tokens,
             tree_profile=tree_profile,
             tree_cache_workers=tree_cache_workers,
+            cache_root=cache_root,
         )
         if precompute_tree_features:
             dataset.set_tree_feature_matrix(
@@ -193,6 +206,7 @@ def main() -> None:
                     dataset.tree_texts,
                     num_workers=tree_cache_workers,
                     chunk_size=tree_feature_chunk_size,
+                    cache_path=build_tree_feature_cache_path(cache_root, dataset, tree_vectorizer),
                 )
             )
         dataloader = DataLoader(
@@ -235,7 +249,7 @@ def main() -> None:
     embedding_array = np.concatenate(embeddings, axis=0) if embeddings else np.empty((0, 0), dtype=np.float32)
 
     checkpoint_tag = f'{checkpoint_path.parent.name}_{checkpoint_path.stem}'
-    output_dir = Path(path_cfg['output_root']) / 'embeddings' / checkpoint_tag
+    output_dir = output_root / 'embeddings' / checkpoint_tag
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f'{args.split}.npz'
     np.savez_compressed(
